@@ -1,0 +1,156 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: thunderbuddy
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: endpoint-inputs
+  namespace: thunderbuddy
+data:
+  namespaces.txt: |
+    tok
+    lon
+    bos
+    abq
+    sfo
+  services.txt: |
+    haproxy-service
+    app-service
+    db-service
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: endpoint-script
+  namespace: thunderbuddy
+data:
+  check-endpoints.sh: |
+    #!/bin/sh
+    FAIL=0
+    TIMEOUTSECS=1
+    TMP_DIR=/tmp/endpoint-check-status
+    mkdir -p "$TMP_DIR"
+
+    for ns in $(cat /etc/config/namespaces.txt); do
+      for svc in $(cat /etc/config/services.txt); do
+        URL="http://${svc}.${ns}.svc.cluster.local/healthz"
+        STATUS_FILE="${TMP_DIR}/${NAME}.status"
+        DEDUP_KEY="endpoint-${ns}-${svc}"
+
+        printf "%-70s" " Checking http://${svc}.${ns}.svc.cluster.local/healthz "
+        curl --connect-timeout $TIMEOUTSECS -s "$URL" > /dev/null
+        if [ $? -ne 0 ]; then
+          echo "❌"
+          FAIL=1
+          PREV_FAIL_COUNT=0
+          [ -f "$STATUS_FILE" ] && PREV_FAIL_COUNT=$(cat "$STATUS_FILE")
+          FAIL_COUNT=$((PREV_FAIL_COUNT + 1))
+          echo "$FAIL_COUNT" > "$STATUS_FILE"
+
+          if [ "$FAIL_COUNT" -eq 1 ]; then
+            curl -s -X POST -H 'Content-type: application/json' \
+              --data "{\"text\":\"🚨 The $svc service on $ns is unreachable\"}" \
+              "$SLACK_WEBHOOK_URL" > /dev/null
+          elif [ "$FAIL_COUNT" -eq 2 ]; then
+            curl -s -X POST "https://events.pagerduty.com/v2/enqueue" \
+              -H "Content-Type: application/json" \
+              -d "{
+                    \"routing_key\": \"$PAGERDUTY_API_KEY\",
+                    \"event_action\": \"trigger\",
+                    \"dedup_key\": \"$DEDUP_KEY\",
+                    \"payload\": {
+                      \"summary\": \"The $svc service on $ns is unreachable\",
+                      \"source\": \"endpoint-checker\",
+                      \"severity\": \"critical\"
+                    }
+                  }" > /dev/null
+          fi
+        else
+          echo "✅"
+          if [ -f "$STATUS_FILE" ] && [ "$(cat "$STATUS_FILE")" -gt 0 ]; then
+            echo 0 > "$STATUS_FILE"
+            curl -s -X POST -H 'Content-type: application/json' \
+              --data "{\"text\":\"✅ The $svc service on $ns has recovered\"}" \
+              "$SLACK_WEBHOOK_URL" > /dev/null
+
+            curl -s -X POST "https://events.pagerduty.com/v2/enqueue" \
+              -H "Content-Type: application/json" \
+              -d "{
+                    \"routing_key\": \"$PAGERDUTY_API_KEY\",
+                    \"event_action\": \"resolve\",
+                    \"dedup_key\": \"$DEDUP_KEY\"
+                  }" > /dev/null
+          fi
+        fi
+      done
+    done
+    NOW=$(date +"%H:%M on %m/%d/%Y")
+    if [ $FAIL -ne 0 ]; then
+      printf "\n Some endpoints are unhealthy as of $NOW \n\n"
+    else
+      printf "\n All endpoints are healthy as of $NOW \n\n"
+    fi
+    printf '%*s\n' 73 '' | tr ' ' '*'
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: all-secrets
+  namespace: thunderbuddy
+type: Opaque
+stringData:
+  SLACK_WEBHOOK_URL: https://hooks.slack.com/services/{{REDACTED}}
+  PAGERDUTY_API_KEY: {{REDACTED}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: endpoint-checker
+  namespace: thunderbuddy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: endpoint-checker
+  template:
+    metadata:
+      labels:
+        app: endpoint-checker
+    spec:
+      containers:
+      - name: checker
+        image: curlimages/curl:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            export SLACK_WEBHOOK_URL=$(cat /etc/secrets/SLACK_WEBHOOK_URL)
+            export PAGERDUTY_API_KEY=$(cat /etc/secrets/PAGERDUTY_API_KEY)
+            cp /app/check-endpoints.sh /tmp/check-endpoints.sh
+            chmod +x /tmp/check-endpoints.sh
+            printf '%*s\n' 73 '' | tr ' ' '*'
+            while true; do
+              /tmp/check-endpoints.sh
+              sleep 60
+            done
+        volumeMounts:
+        - name: bash-app
+          mountPath: /app
+          readOnly: true
+        - name: configs
+          mountPath: /etc/config
+          readOnly: true
+        - name: endpoint-secrets
+          mountPath: /etc/secrets
+          readOnly: true
+      volumes:
+      - name: bash-app
+        configMap:
+          name: endpoint-script
+      - name: configs
+        configMap:
+          name: endpoint-inputs
+      - name: endpoint-secrets
+        secret:
+          secretName: all-secrets
