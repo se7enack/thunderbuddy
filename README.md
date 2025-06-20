@@ -47,6 +47,10 @@ kubectl apply -f thunderbuddy.yaml
 
 - To disable this tool go deployments under the `thunderbuddy` namespace and scale `endpoint-checker` to `0`
 
+## Screenshot
+
+![pic](https://github.com/user-attachments/assets/f7929597-b0ab-4a44-a799-4daba8e98b35)
+
 
 
 #
